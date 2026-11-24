@@ -1,0 +1,332 @@
+"""Supabase PostgREST tools for the Modern Furniture Pacific sales assistant.
+
+All five tools are read-only. Product rows come from the live Supabase
+backend (project hpdcfkhwznlcecjtdtid); prices are never invented — every
+price the assistant quotes comes from one of these calls.
+"""
+from __future__ import annotations
+
+import contextvars
+import json
+import os
+import urllib.parse
+from typing import Any
+
+import httpx
+from langchain_core.tools import tool
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+BASE = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
+
+WHATSAPP_NUMBER = "254716335555"
+
+# Products the tools returned during the current /chat run. Reset at the
+# start of each request (see app/agent.py); main.py reads it to build the
+# response's `products` array.
+_seen_products: contextvars.ContextVar[list[dict[str, Any]]] = contextvars.ContextVar(
+    "mfp_seen_products", default=[]
+)
+
+
+def reset_seen_products() -> None:
+    _seen_products.set([])
+
+
+def get_seen_products() -> list[dict[str, Any]]:
+    return list(_seen_products.get())
+
+
+def _headers() -> dict[str, str]:
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Accept": "application/json",
+    }
+
+
+def _get(path: str, params: dict[str, Any] | None = None) -> Any:
+    if not BASE or not SUPABASE_ANON_KEY:
+        raise RuntimeError("SUPABASE_URL / SUPABASE_ANON_KEY are not configured")
+    with httpx.Client(timeout=20.0) as client:
+        resp = client.get(f"{BASE}{path}", headers=_headers(), params=params or {})
+        resp.raise_for_status()
+        return resp.json()
+
+
+PRODUCT_SELECT = (
+    "handle,title,original_title,type,price_min,price_max,in_stock,"
+    "is_new,is_best_seller,description,"
+    "categories(name,slug),"
+    "product_variants(option,price,available,position)"
+)
+
+
+def _category_name(row: dict[str, Any]) -> str:
+    cat = row.get("categories")
+    if isinstance(cat, dict):
+        return cat.get("name") or ""
+    if isinstance(cat, list) and cat:
+        return cat[0].get("name") or ""
+    return ""
+
+
+def _fmt_price(value: float | int) -> str:
+    return f"KSh {int(value):,}"
+
+
+def _price_label(row: dict[str, Any]) -> str:
+    lo, hi = row["price_min"], row["price_max"]
+    if lo == hi:
+        return _fmt_price(lo)
+    return f"{_fmt_price(lo)} - {_fmt_price(hi)}"
+
+
+def _card(row: dict[str, Any], include_variants: bool = False) -> dict[str, Any]:
+    handle = row["handle"]
+    title = row["title"]
+    price = _price_label(row)
+    text = urllib.parse.quote(f"Hi, I would like to order the {title} ({price})")
+    card: dict[str, Any] = {
+        "handle": handle,
+        "title": title,
+        "category": _category_name(row),
+        "price_min": row["price_min"],
+        "price_max": row["price_max"],
+        "price": price,
+        "in_stock": row["in_stock"],
+        "is_best_seller": row.get("is_best_seller", False),
+        "is_new": row.get("is_new", False),
+        "premium_image": f"/images/premium/{handle}-premium.jpg",
+        "image_3d": f"/images/premium/{handle}-3d.jpg",
+        "product_url": f"/products/{handle}",
+        "whatsapp_link": f"https://wa.me/{WHATSAPP_NUMBER}?text={text}",
+    }
+    if include_variants:
+        variants = sorted(row.get("product_variants") or [], key=lambda v: v.get("position", 0))
+        card["variants"] = [
+            {
+                "option": v["option"],
+                "price": v["price"],
+                "available": v.get("available", True),
+            }
+            for v in variants
+        ]
+        if row.get("description"):
+            card["description"] = row["description"]
+    return card
+
+
+def _record(rows: list[dict[str, Any]], include_variants: bool = False) -> None:
+    seen = _seen_products.get()
+    have = {p["handle"] for p in seen}
+    for row in rows:
+        if row["handle"] not in have:
+            seen.append(_card(row, include_variants=include_variants))
+            have.add(row["handle"])
+    _seen_products.set(seen)
+
+
+def _fetch_all_products() -> list[dict[str, Any]]:
+    rows = _get(
+        "/products",
+        {
+            "select": PRODUCT_SELECT,
+            "product_variants.order": "position.asc",
+            "order": "price_min.asc",
+        },
+    )
+    return rows if isinstance(rows, list) else []
+
+
+@tool
+def search_products(
+    query: str = "",
+    category: str = "",
+    max_price: float = 0,
+    min_price: float = 0,
+    in_stock_only: bool = True,
+    limit: int = 5,
+) -> str:
+    """Search Modern Furniture Pacific products by keyword, category and price.
+
+    Args:
+        query: keywords to match against product titles (e.g. "7 seater sofa", "bed").
+        category: category name filter, e.g. "Living Room", "Bedroom", "Dining", "Tables".
+        max_price: only products whose lowest price is at most this (KES). 0 = no limit.
+        min_price: only products whose highest price is at least this (KES). 0 = no limit.
+        in_stock_only: when true (default), exclude sold-out products.
+        limit: maximum number of products to return (default 5).
+    Returns a JSON list of matching products with handle, title, category,
+    price_min, price_max, in_stock, is_best_seller and is_new.
+    """
+    rows = _fetch_all_products()
+    words = [w for w in query.lower().split() if w]
+    out = []
+    for row in rows:
+        hay = f"{row['title']} {row['handle']} {row.get('type') or ''}".lower()
+        if words and not all(w in hay for w in words):
+            continue
+        if category and category.lower() not in _category_name(row).lower():
+            continue
+        if max_price and row["price_min"] > max_price:
+            continue
+        if min_price and row["price_max"] < min_price:
+            continue
+        if in_stock_only and not row["in_stock"]:
+            continue
+        out.append(row)
+    out = out[: max(1, limit)]
+    _record(out)
+    return json.dumps(
+        [
+            {
+                "handle": r["handle"],
+                "title": r["title"],
+                "category": _category_name(r),
+                "price_min": r["price_min"],
+                "price_max": r["price_max"],
+                "in_stock": r["in_stock"],
+                "is_best_seller": r.get("is_best_seller", False),
+                "is_new": r.get("is_new", False),
+            }
+            for r in out
+        ]
+    )
+
+
+@tool
+def get_product(handle: str) -> str:
+    """Get full details for one product by its handle (e.g. "nova-sofa-set").
+
+    Returns the product with all size/option variants and their prices,
+    stock status, and description. Use this when the customer asks about a
+    specific product by name.
+    """
+    rows = _get(
+        "/products",
+        {
+            "select": PRODUCT_SELECT,
+            "handle": f"eq.{handle}",
+            "product_variants.order": "position.asc",
+        },
+    )
+    if not rows:
+        # Forgiving fallback: the model often guesses a handle. Match the
+        # handle's words against product titles instead of failing outright.
+        words = [w for w in handle.lower().replace("-", " ").split() if w]
+        candidates = []
+        for row in _fetch_all_products():
+            hay = f"{row['title']} {row['handle']}".lower()
+            if words and all(w in hay for w in words):
+                candidates.append(row)
+        if len(candidates) == 1:
+            rows = candidates
+        elif candidates:
+            return json.dumps(
+                {
+                    "error": f"No product with handle '{handle}'. Close matches:",
+                    "matches": [
+                        {"handle": r["handle"], "title": r["title"]} for r in candidates
+                    ],
+                }
+            )
+        else:
+            return json.dumps({"error": f"No product found with handle '{handle}'"})
+    _record(rows, include_variants=True)
+    row = rows[0]
+    return json.dumps(
+        {
+            "handle": row["handle"],
+            "title": row["title"],
+            "category": _category_name(row),
+            "price_min": row["price_min"],
+            "price_max": row["price_max"],
+            "in_stock": row["in_stock"],
+            "is_best_seller": row.get("is_best_seller", False),
+            "is_new": row.get("is_new", False),
+            "description": row.get("description"),
+            "variants": [
+                {
+                    "option": v["option"],
+                    "price": v["price"],
+                    "available": v.get("available", True),
+                }
+                for v in sorted(
+                    row.get("product_variants") or [], key=lambda v: v.get("position", 0)
+                )
+            ],
+        }
+    )
+
+
+@tool
+def compare_products(handles: list[str]) -> str:
+    """Compare 2-3 products side by side by their handles.
+
+    Returns each product's title, category, price range, stock status and
+    variants so the customer can see the differences.
+    """
+    handles = list(handles)[:3]
+    rows: list[dict[str, Any]] = []
+    for handle in handles:
+        found = _get(
+            "/products",
+            {
+                "select": PRODUCT_SELECT,
+                "handle": f"eq.{handle}",
+                "product_variants.order": "position.asc",
+            },
+        )
+        rows.extend(found or [])
+    _record(rows, include_variants=True)
+    return json.dumps(
+        [
+            {
+                "handle": r["handle"],
+                "title": r["title"],
+                "category": _category_name(r),
+                "price_min": r["price_min"],
+                "price_max": r["price_max"],
+                "in_stock": r["in_stock"],
+                "variants": [
+                    {"option": v["option"], "price": v["price"]}
+                    for v in sorted(
+                        r.get("product_variants") or [], key=lambda v: v.get("position", 0)
+                    )
+                ],
+            }
+            for r in rows
+        ]
+    )
+
+
+@tool
+def list_categories() -> str:
+    """List the product categories available at Modern Furniture Pacific."""
+    rows = _get("/categories", {"select": "name,slug", "order": "name.asc"})
+    return json.dumps([{"name": r["name"], "slug": r["slug"]} for r in rows])
+
+
+@tool
+def get_business_info() -> str:
+    """Get the store's business info: name, tagline, phones, WhatsApp number,
+    email, opening hours and showroom locations."""
+    rows = _get("/business_info", {"select": "*", "limit": 1})
+    if not rows:
+        return json.dumps({"error": "No business info found"})
+    row = rows[0]
+    return json.dumps(
+        {
+            "name": row.get("name"),
+            "tagline": row.get("tagline"),
+            "phone": row.get("phone"),
+            "whatsapp": row.get("whatsapp"),
+            "email": row.get("email"),
+            "hours": row.get("hours"),
+            "showrooms": row.get("showrooms"),
+        }
+    )
+
+
+TOOLS = [search_products, get_product, compare_products, list_categories, get_business_info]
