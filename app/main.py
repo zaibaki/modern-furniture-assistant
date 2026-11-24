@@ -29,6 +29,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     products: list[dict] = []
+    whatsapp_shortlist_link: str | None = None
 
 
 @app.get("/health")
@@ -39,4 +40,8 @@ def health() -> dict:
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     result = run_chat([m.model_dump() for m in req.messages])
-    return ChatResponse(answer=result["answer"], products=result["products"])
+    return ChatResponse(
+        answer=result["answer"],
+        products=result["products"],
+        whatsapp_shortlist_link=result.get("whatsapp_shortlist_link"),
+    )

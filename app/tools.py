@@ -27,6 +27,9 @@ WHATSAPP_NUMBER = "254716335555"
 _seen_products: contextvars.ContextVar[list[dict[str, Any]]] = contextvars.ContextVar(
     "mfp_seen_products", default=[]
 )
+_budget_kes: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "mfp_budget_kes", default=None
+)
 
 
 def reset_seen_products() -> None:
@@ -35,6 +38,26 @@ def reset_seen_products() -> None:
 
 def get_seen_products() -> list[dict[str, Any]]:
     return list(_seen_products.get())
+
+
+def set_budget_kes(budget: float | None) -> None:
+    _budget_kes.set(budget)
+
+
+def get_budget_kes() -> float | None:
+    return _budget_kes.get()
+
+
+def build_whatsapp_shortlist_link(products: list[dict[str, Any]]) -> str | None:
+    """Build a prefilled WhatsApp link for the customer's in-stock shortlist."""
+    shortlist = [p for p in products if p.get("in_stock", True)]
+    if not shortlist:
+        return None
+    lines = ["Hi, I would like to order from Modern Furniture Pacific:"]
+    for p in shortlist[:5]:
+        lines.append(f"- {p['title']} ({p['price']})")
+    text = urllib.parse.quote("\n".join(lines))
+    return f"https://wa.me/{WHATSAPP_NUMBER}?text={text}"
 
 
 def _headers() -> dict[str, str]:
@@ -161,6 +184,10 @@ def search_products(
     price_min, price_max, in_stock, is_best_seller and is_new.
     """
     rows = _fetch_all_products()
+    active_budget = get_budget_kes()
+    effective_max = max_price
+    if active_budget and active_budget > 0:
+        effective_max = min(max_price, active_budget) if max_price > 0 else active_budget
     words = [w for w in query.lower().split() if w]
     out = []
     for row in rows:
@@ -169,7 +196,7 @@ def search_products(
             continue
         if category and category.lower() not in _category_name(row).lower():
             continue
-        if max_price and row["price_min"] > max_price:
+        if effective_max and row["price_min"] > effective_max:
             continue
         if min_price and row["price_max"] < min_price:
             continue
