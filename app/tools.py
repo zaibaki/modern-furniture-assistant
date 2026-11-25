@@ -17,6 +17,7 @@ from langchain_core.tools import tool
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 BASE = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
 
 WHATSAPP_NUMBER = "254716335555"
@@ -68,11 +69,17 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _get(path: str, params: dict[str, Any] | None = None) -> Any:
-    if not BASE or not SUPABASE_ANON_KEY:
-        raise RuntimeError("SUPABASE_URL / SUPABASE_ANON_KEY are not configured")
+def _get(path: str, params: dict[str, Any] | None = None, service_role: bool = False) -> Any:
+    key = SUPABASE_SERVICE_ROLE_KEY if service_role else SUPABASE_ANON_KEY
+    if not BASE or not key:
+        raise RuntimeError("SUPABASE_URL / Supabase key are not configured")
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
     with httpx.Client(timeout=20.0) as client:
-        resp = client.get(f"{BASE}{path}", headers=_headers(), params=params or {})
+        resp = client.get(f"{BASE}{path}", headers=headers, params=params or {})
         resp.raise_for_status()
         return resp.json()
 
@@ -356,4 +363,109 @@ def get_business_info() -> str:
     )
 
 
-TOOLS = [search_products, get_product, compare_products, list_categories, get_business_info]
+def _norm_phone_tail(phone: str) -> str:
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    return digits[-9:] if len(digits) >= 9 else digits
+
+
+@tool
+def lookup_order(reference: str, phone: str) -> str:
+    """Look up a customer's submitted order status after verifying both order
+    reference (e.g. 'MFP-AB12CD') and phone number.
+    """
+    ref = reference.strip().upper()
+    tail = _norm_phone_tail(phone)
+    if not ref or len(tail) < 7:
+        return json.dumps(
+            {
+                "verified": False,
+                "error": "Both a valid order reference (e.g. MFP-XXXXXX) and phone number are required.",
+            }
+        )
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return json.dumps(
+            {
+                "verified": False,
+                "error": "Order lookup is temporarily unavailable. Please escalate to a human on WhatsApp (0716 335555).",
+            }
+        )
+    rows = _get(
+        "/orders",
+        {"select": "*", "reference": f"eq.{ref}", "limit": 1},
+        service_role=True,
+    )
+    if not rows:
+        return json.dumps(
+            {
+                "verified": False,
+                "error": f"No order found with reference '{ref}'. Please double-check the reference.",
+            }
+        )
+    row = rows[0]
+    if _norm_phone_tail(row.get("phone", "")) != tail:
+        return json.dumps(
+            {
+                "verified": False,
+                "error": "The phone number does not match this order reference.",
+            }
+        )
+    return json.dumps(
+        {
+            "verified": True,
+            "reference": row["reference"],
+            "status": row["status"],
+            "product_title": row["product_title"],
+            "product_price": row.get("product_price"),
+            "option": row.get("option"),
+            "quantity": row.get("quantity", 1),
+            "customer_name": row["customer_name"],
+            "location": row["location"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "whatsapp_link": row.get("whatsapp_link"),
+        }
+    )
+
+
+@tool
+def escalate_to_human(
+    reason: str,
+    customer_name: str = "",
+    phone: str = "",
+    order_reference: str = "",
+) -> str:
+    """Escalate the conversation to a human sales representative on WhatsApp.
+
+    ONLY call this when the customer explicitly asks to speak with a human,
+    or when the issue cannot be resolved with the available tools. Never
+    auto-invoke this for normal product or order-status questions.
+    """
+    lines = ["Hi Modern Furniture Pacific team, I need human assistance:"]
+    if order_reference.strip():
+        lines.append(f"- Order Ref: {order_reference.strip().upper()}")
+    if customer_name.strip():
+        lines.append(f"- Name: {customer_name.strip()}")
+    if phone.strip():
+        lines.append(f"- Phone: {phone.strip()}")
+    lines.append(f"- Details: {reason.strip() or 'Customer requested human support'}")
+    wa_link = f"https://wa.me/{WHATSAPP_NUMBER}?text={urllib.parse.quote(chr(10).join(lines))}"
+    return json.dumps(
+        {
+            "escalated": True,
+            "whatsapp_link": wa_link,
+            "phone": "0716 335555",
+            "email": "info@modernfurniturepacificltd.com",
+            "hours": "Mon-Sat 9am-10pm, Sun 10am-6pm",
+        }
+    )
+
+
+TOOLS = [
+    search_products,
+    get_product,
+    compare_products,
+    list_categories,
+    get_business_info,
+    lookup_order,
+    escalate_to_human,
+]

@@ -60,6 +60,13 @@ get_product. When they describe what they want, call search_products. \
 Compare with compare_products when they ask to choose between products, and \
 format comparisons as a complete Markdown table comparing every variant/size \
 and price (highlighting budget fit).
+- When a customer asks to follow up on, track, or check an order, DO NOT just \
+give store contact details. Ask for BOTH their order reference (e.g. MFP-XXXXXX) \
+and their phone number if either is missing, then call lookup_order to verify \
+and report their live order status, item, option, and delivery location.
+- NEVER auto-invoke escalate_to_human on normal product or order-status questions. \
+Only call escalate_to_human when the customer explicitly asks to talk to a human \
+or when an issue genuinely cannot be resolved after checking the tools.
 """
 
 
