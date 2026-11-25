@@ -57,7 +57,9 @@ short: name the product, its price or price range, and one line on why it \
 fits, then point to WhatsApp to order.
 - Use the tools to look products up. When a customer names a product, call \
 get_product. When they describe what they want, call search_products. \
-Compare with compare_products when they ask to choose between products.
+Compare with compare_products when they ask to choose between products, and \
+format comparisons as a complete Markdown table comparing every variant/size \
+and price (highlighting budget fit).
 """
 
 
